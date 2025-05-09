@@ -1,0 +1,84 @@
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import re
+from dask.distributed import Client
+import dask.dataframe as dd
+import pyarrow.parquet as pq
+
+class DistributedMeteoProcessor:
+    def __init__(self, data_dir: str, output_dir: str):
+        self.data_dir = Path(data_dir)
+        self.output_dir = Path(output_dir)
+        self.file_pattern = re.compile(r"(\d{6})-(\d{5})-(\d{4})\.txt")
+        self.schema = {
+            'year': 'uint16', 'month': 'uint8', 'day': 'uint8', 'hour': 'uint8',
+            'temperature': 'float32', 'humidity': 'float32', 'pressure': 'float32',
+            'wind_speed': 'float32', 'precipitation': 'float32'
+        }
+        
+        # 创建Dask集群
+        self.client = Client(
+            n_workers=8, 
+            threads_per_worker=4,
+            memory_limit='16GB'
+        )
+
+    def _parse_metadata(self, path: str) -> dict:
+        """增强型文件名解析"""
+        filename = Path(path).name
+        match = self.file_pattern.match(filename)
+        return {
+            'station_id': match.group(1),
+            'geo_code': match.group(2),
+            'data_year': int(match.group(3))
+        } if match else {}
+
+    def _transform_chunk(self, df: pd.DataFrame, meta: dict) -> pd.DataFrame:
+        """数据块处理流水线"""
+        # 单位转换
+        df['temperature'] = df.temperature * 0.1
+        df['pressure'] = df.pressure * 0.1
+        
+        # 添加元数据
+        for k, v in meta.items():
+            df[k] = v
+            
+        # 构建时间索引
+        df['datetime'] = pd.to_datetime(
+            df[['year', 'month', 'day', 'hour']]
+        )
+        return df[['station_id', 'datetime'] + list(self.schema.keys())]
+
+    def process_files(self):
+        """分布式处理主引擎"""
+        # 创建输出目录结构
+        (self.output_dir / 'temp').mkdir(exist_ok=True)
+        
+        # 构建Dask延迟计算图
+        delayed_tasks = []
+        for path in self.data_dir.glob("*.txt"):
+            meta = self._parse_metadata(path.name)
+            task = dask.delayed(pd.read_csv)(
+                path,
+                delim_whitespace=True,
+                names=list(self.schema.keys()),
+                dtype=self.schema
+            ).pipe(self._transform_chunk, meta)
+            delayed_tasks.append(task)
+        
+        # 并行执行并合并结果
+        ddf = dd.from_delayed(delayed_tasks)
+        
+        # 分区存储优化
+        ddf.to_parquet(
+            self.output_dir,
+            engine='pyarrow',
+            partition_on=['station_id', 'data_year'],
+            schema={
+                'station_id': 'string',
+                'datetime': 'timestamp[ns]',
+                ​**self.schema
+            },
+            compression='zstd'
+        )
